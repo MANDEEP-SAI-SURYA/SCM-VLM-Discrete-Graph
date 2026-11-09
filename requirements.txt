@@ -1,0 +1,14 @@
+torch
+transformers
+timm
+openai
+torchvision
+pillow
+numpy
+matplotlib
+networkx
+opencv-python
+scipy
+pytest
+seaborn
+pandas

@@ -1,0 +1,58 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+checkpoints
+
+# VS Code
+.vscode/
+
+# PyTorch / ML checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Dataset files
+coco/
+coco/train2014/
+coco/vqa/
+
+# Results / generated outputs
+results/
+logs/
+outputs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.swp
+
+# Testing cache
+.pytest_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Cached DETR/BERT features (train.py)
+cache/
