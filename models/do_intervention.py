@@ -45,6 +45,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs.coco_labels import NO_OBJECT_ID, label_to_id
+from models.intervention import influenced_nodes
 from models.scene_answer import SceneObject
 
 
@@ -422,6 +423,7 @@ class CounterfactualResult:
     steering: dict = field(default_factory=dict)
     cf_index_map: dict = field(default_factory=dict)  # factual idx -> cf idx
     mode: str = "do"                   # "do" (fixed graph) or "recompute" (graph re-estimated)
+    diagnostic: bool = False           # model passes child -> parent messages too
 
 
 def descendants_of(adjacency: torch.Tensor, nodes: list[int], eps: float = 1e-8) -> list[int]:
@@ -513,8 +515,15 @@ class DoInterventionReasoner:
     def _batch(tensor):
         return None if tensor is None else tensor.unsqueeze(0)
 
-    def _decode(self, hidden: torch.Tensor, question_embedding: torch.Tensor) -> torch.Tensor:
-        return self.model.decode(hidden.unsqueeze(0), question_embedding)[0]
+    def _decode(self, hidden: torch.Tensor, question_embedding: torch.Tensor,
+                question: str | None = None, labels=None, boxes_norm=None) -> torch.Tensor:
+        """Answer logits; with symbolic fusion the rule-based answer on THIS scene (labels,
+        boxes) is fused in, so a counterfactual scene gets its own symbolic answer."""
+        logits = self.model.decode(hidden.unsqueeze(0), question_embedding)
+        if getattr(self.model, "symbolic_fusion", False) and labels is not None:
+            evidence = self.model.symbolic_evidence(question, labels, boxes_norm)
+            logits = self.model.fuse(logits, question_embedding, evidence)
+        return logits[0]
 
     def _propagate(self, objects: torch.Tensor, adjacency: torch.Tensor, boxes_norm=None,
                    relation_probs=None) -> torch.Tensor:
@@ -568,16 +577,23 @@ class DoInterventionReasoner:
                                      device=raw_objects.device)
         q = self.model.text(question)
         objects = self.model.encode_nodes(raw_objects.unsqueeze(0), class_ids.unsqueeze(0), self._batch(boxes_norm))
-        graph = self.model.build_graph(objects, q, self._batch(boxes_norm))
+        graph = self.model.build_graph(objects, q, self._batch(boxes_norm), class_ids.unsqueeze(0))
         adjacency = graph["adjacency"]
         relation_probs = graph.get("relation_probs")
         hidden, _ = self.model.run_causal_layers(objects, adjacency, self._batch(boxes_norm), relation_probs)
-        logits = self.model.decode(hidden, q)
+        logits = self._decode(hidden[0], q, question, list(labels), boxes_norm).unsqueeze(0)
         return World(list(labels), raw_objects, objects[0], adjacency[0], hidden[0], logits[0],
                      question, q, edge_probs=graph["probs"][0], boxes_norm=boxes_norm, class_ids=class_ids,
                      relation_probs=None if relation_probs is None else relation_probs[0])
 
     # ---------------------------------------------------------------
+    def _influenced(self, adjacency: torch.Tensor, nodes: list[int], excluded: list[int] | None = None) -> list[int]:
+        """Nodes recomputed by a do()-style intervention on ``nodes``: their descendants, or, with
+        diagnostic (child -> parent) messages, every node connected to them in the graph."""
+        if getattr(self.model, "diagnostic_messages", False):
+            return influenced_nodes(adjacency, nodes, diagnostic=True, excluded=excluded)
+        return [d for d in descendants_of(adjacency, nodes) if d not in nodes]
+
     def _target_nodes(self, world: World, intervention: Intervention) -> list[int]:
         if intervention.nodes:
             bad = [i for i in intervention.nodes if i < 0 or i >= len(world.labels)]
@@ -634,7 +650,7 @@ class DoInterventionReasoner:
             drift = max(drift, float((full[c_idx] - world.hidden[f_idx]).abs().max()))
             cf_hidden[c_idx] = world.hidden[f_idx]       # Eq. 14: non-descendants keep h
             unaffected.append(f_idx)
-        cf_logits = self._decode(cf_hidden, world.question_embedding)
+        cf_logits = self._decode(cf_hidden, world.question_embedding, world.question, cf_labels, cf_boxes_norm)
         inverse = {c: f for f, c in index_map.items()}
         cf_boxes = None
         if world.boxes is not None:
@@ -643,7 +659,8 @@ class DoInterventionReasoner:
                          world.question, world.question_embedding, boxes=cf_boxes, boxes_norm=cf_boxes_norm,
                          class_ids=cf_class_ids, relation_probs=cf_relation_probs)
         return CounterfactualResult(intervention, world, cf_world, intervened, descendants,
-                                    sorted(unaffected), drift, steering, index_map)
+                                    sorted(unaffected), drift, steering, index_map,
+                                    diagnostic=bool(getattr(self.model, "diagnostic_messages", False)))
 
     def _finish_recompute(self, world, intervention, cf_objects, cf_labels, cf_raw,
                           intervened, index_map, steering, cf_class_ids=None) -> CounterfactualResult:
@@ -652,12 +669,13 @@ class DoInterventionReasoner:
         Y' = Decoder(h', q)."""
         q = world.question_embedding
         cf_boxes_norm = self._cf_boxes_norm(world, index_map, len(cf_labels))
-        graph = self.model.build_graph(cf_objects.unsqueeze(0), q, self._batch(cf_boxes_norm))
+        graph = self.model.build_graph(cf_objects.unsqueeze(0), q, self._batch(cf_boxes_norm),
+                                       None if cf_class_ids is None else cf_class_ids.unsqueeze(0))
         cf_adj = graph["adjacency"][0]
         cf_probs = graph["probs"][0]
         cf_relation_probs = None if graph.get("relation_probs") is None else graph["relation_probs"][0]
         cf_hidden = self._propagate(cf_objects, cf_adj, cf_boxes_norm, cf_relation_probs)
-        cf_logits = self._decode(cf_hidden, q)
+        cf_logits = self._decode(cf_hidden, q, world.question, cf_labels, cf_boxes_norm)
 
         changed, unaffected = [], []
         for f_idx, c_idx in index_map.items():
@@ -784,7 +802,13 @@ class DoInterventionReasoner:
         keep = [i for i in range(len(world.labels)) if i not in removed]
         if not keep:
             raise ValueError("Removing every detected object leaves an empty scene.")
-        descendants = [d for d in descendants_of(world.adjacency, removed) if d not in removed]
+        if getattr(self.model, "diagnostic_messages", False):
+            graph = world.adjacency.detach().cpu() > 1e-8
+            neighbours = sorted({int(n) for k in removed for n in torch.nonzero(graph[:, k] | graph[k, :]).flatten()
+                                 if int(n) not in removed})
+            descendants = sorted(set(neighbours) | set(self._influenced(world.adjacency, neighbours, removed)))
+        else:
+            descendants = [d for d in descendants_of(world.adjacency, removed) if d not in removed]
         index_map = {f: c for c, f in enumerate(keep)}
         keep_t = torch.tensor(keep, device=world.adjacency.device)
         cf_adj = world.adjacency.index_select(0, keep_t).index_select(1, keep_t)
@@ -815,7 +839,7 @@ class DoInterventionReasoner:
             cf_adj[k, :] = 0.0                                                              # Eq. 12
             cf_labels[k] = new_label
             steering[k] = {"label": new_label, "prob": prob, "converged": ok}
-        descendants = [d for d in descendants_of(cf_adj, nodes) if d not in nodes]
+        descendants = self._influenced(cf_adj, nodes)
         index_map = {i: i for i in range(len(world.labels))}
         affected_cf = set(nodes) | set(descendants)
         cf_class_ids = self._cf_class_ids(world, index_map, len(cf_labels), {k: new_id for k in nodes})
@@ -870,7 +894,7 @@ class DoInterventionReasoner:
             cf_labels[k] = f"{attribute} {name}"
             steering[k] = {"label": cf_labels[k], "prob": after, "converged": after > before,
                            "attribute": True, "similarity_before": before, "similarity_after": after}
-        descendants = [d for d in descendants_of(cf_adj, nodes) if d not in nodes]
+        descendants = self._influenced(cf_adj, nodes)
         index_map = {i: i for i in range(len(world.labels))}
         affected_cf = set(nodes) | set(descendants)
         return self._finish(world, intervention, cf_objects, cf_adj, cf_labels, world.raw_objects.clone(),
@@ -890,8 +914,10 @@ class DoInterventionReasoner:
         cf_objects = torch.cat([world.objects, self._encode_one(x_prime, new_id, new_box).unsqueeze(0)], dim=0)
         # Learned edge function decides whom the new object influences (its column);
         # its own row stays empty because do() makes it exogenous.
+        add_ids = self._cf_class_ids(world, index_map_add, n + 1, {n: new_id})
         scored_graph = self.model.build_graph(cf_objects.unsqueeze(0), world.question_embedding,
-                                              self._batch(cf_boxes_norm))
+                                              self._batch(cf_boxes_norm),
+                                              None if add_ids is None else add_ids.unsqueeze(0))
         scored = scored_graph["adjacency"][0]
         cf_relation_probs = None
         if scored_graph.get("relation_probs") is not None:
@@ -903,7 +929,7 @@ class DoInterventionReasoner:
         cf_adj[:n, n] = scored[:n, n]
         cf_adj = self._normalise(cf_adj)
         cf_adj[n, :] = 0.0
-        descendants_cf = descendants_of(cf_adj, [n])
+        descendants_cf = self._influenced(cf_adj, [n])
         descendants = [d for d in descendants_cf if d < n]
         index_map = {i: i for i in range(n)}
         affected_cf = set(descendants) | {n}
@@ -993,13 +1019,16 @@ class DoInterventionReasoner:
         index_map = result.cf_index_map
         graph = factual.adjacency if kind != "add" else cf.adjacency
         sources = nodes
+        diagnostic = bool(getattr(result, "diagnostic", False))
         effects = []
         for d in result.descendants:
             c = index_map.get(d, d)
             before = factual.hidden[d]
             after = cf.hidden[c]
             change_size = float((after - before).norm() / before.norm().clamp(min=1e-8))
-            direct = any(graph[d if kind != "add" else c, src] > 1e-6 for src in sources if src < graph.shape[1])
+            row = d if kind != "add" else c
+            direct = any(graph[row, src] > 1e-6 or (result.mode == "do" and diagnostic and graph[src, row] > 1e-6)
+                         for src in sources if src < graph.shape[1])
             effects.append({"node": d, "label": factual.labels[d], "relative_change": change_size,
                             "direct": bool(direct)})
         effects.sort(key=lambda item: -item["relative_change"])

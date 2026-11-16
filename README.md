@@ -1,3 +1,186 @@
+# SCM-VLM with a Discrete Causal Graph Layer
+
+> **This is a separate copy of the SCM-VLM project.** The original project is unchanged.
+> It adds the **Discrete Causal Graph Sampling layer** (`--graph-mode discrete`) and,
+> further down, **adaptive loss weighting + curriculum** and **neuro-symbolic knowledge**.
+> These come from the paper's future work, which says:
+> *"While the present architecture uses soft adjacency constrained attention, future research may
+> work on exploring discrete graph sampling techniques and probabilistic causal discovery methods
+> to improve structural interpretability and stability."*
+
+## New: Discrete Causal Graph Sampling layer
+
+**Problem with the soft graph.** Every object always receives exactly k parents (soft top-k
+attention). A graph in which every node has a parent always contains a cycle, so the NOTEARS
+acyclicity term can never reach zero: the "causal graph" is never actually a DAG, there are no
+root causes, and edges are dense.
+
+**The layer** (`models/scm_graph.py`, `SCMGraph(mode="discrete")`):
+
+1. **Learned causal order.** Each object gets a question-conditioned order score
+   `r_i = MLP([o_i ; q])`, sampled with Gumbel noise during training (a sampled causal order).
+   An object can only choose parents that come earlier in the order, so **every graph is a DAG
+   by construction** (acyclicity is guaranteed, not just penalised) and the first object is a root.
+2. **Discrete parent sets with an exogenous option.** Each object chooses its top-k parents among
+   the allowed objects **and a learnable "no parent" option** (root cause). Training: Gumbel top-k
+   with a straight-through estimator (discrete forward pass, relaxed gradient to every edge and
+   order score), temperature annealed from `--tau-start` (1.0) to `--tau-end` (0.2). Test time:
+   deterministic.
+3. **Causal and diagnostic messages.** Pearl-style belief propagation on the DAG: messages flow
+   parent -> child (causal) and child -> parent (diagnostic) along the same edges, with separate
+   transforms (`models/causal_attention.py`). A do() intervention that cuts the edges into k
+   removes them in both directions.
+4. **Parent-selection supervision.** The parent choice is supervised by the contact prior: an
+   object should choose the touching objects that come before it, or "no parent" when there is
+   none (`parent_selection_loss` in `train.py`). The sparsity penalty is not used (top-k parent
+   sets are sparse by construction; with it, every object chose "no parent").
+
+New metrics (`utils/evaluation.py`, `graph_structure`): acyclicity h(A), DAG rate, share of
+root-cause objects, parents per object, structural stability (edge-set overlap under small input
+noise), "no parent" weight. They are reported for every graph model, so the soft and discrete
+graphs can be compared directly.
+
+```bash
+python train.py --samples 30000 --epochs 10 --tag soft                         # original soft graph
+python train.py --samples 30000 --epochs 10 --graph-mode discrete --tag discrete
+python relation_analysis.py --checkpoint checkpoints/scm_vlm_discrete.pt --samples 30000 --tag discrete
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--graph-mode discrete` | | the new layer |
+| `--tau-start`, `--tau-end` | 1.0, 0.2 | Gumbel temperature annealing (geometric, per epoch) |
+| `--graph-top-k` | 3 | candidates chosen per object (discrete: including "no parent") |
+
+Checks run on fake data (stubbed DETR/BERT, 3 seeds; **not evidence about real VQA**):
+
+| | soft graph | discrete causal graph |
+|---|---|---|
+| acyclic graphs (DAG) | 3 % | **100 %** (guaranteed) |
+| acyclicity h(A) | 0.53 | **0.00** |
+| root-cause objects | 10 % | 56 % |
+| parents per object | 1.39 | 0.46 |
+| structural stability | 0.99 | 1.00 |
+| factual accuracy | 92.8 ± 0.8 | 90.6 ± 3.9 |
+| counterfactual accuracy | 89.2 ± 1.4 | 89.2 ± 3.7 |
+
+Real accuracy has to be measured on VQA v2 (Colab notebook, section 12).
+
+## New: adaptive loss weighting, curriculum and neuro-symbolic knowledge
+
+Two more items from the paper's Future Work. All of them are **off by default**: without the
+new flags, training is the same as before, and old checkpoints still load.
+
+### 1. Adaptive loss weighting and curriculum (`losses/balancing.py`)
+
+> *"... adaptive weighting mechanisms for dynamically balancing these objectives ... curriculum
+> based optimization strategies and staged regularization scheduling ..."*
+
+The training loss is now a set of separate terms (task, counterfactual, relation supervision,
+acyclicity, sparsity, entropy). `LossBalancer` combines them:
+`total = sum_k w_k(t) * c_k(t) * lambda_k * L_k`.
+
+* `--loss-weighting uncertainty`: learned homoscedastic-uncertainty weights for the three
+  objectives (task, cf, edge), following Kendall, Gal & Cipolla (CVPR 2018). The term is
+  `exp(-s_k) * L_k + s_k / 2`, so noisy objectives get down-weighted automatically.
+* `--loss-weighting dwa`: Dynamic Weight Average (Liu, Johns & Davison, CVPR 2019). An objective
+  whose loss has stopped falling gets more weight.
+* The structural constraints (acyclicity, sparsity, entropy) keep fixed weights. If they were
+  learned, the model could simply switch them off.
+* `--curriculum staged` (staged regularisation):
+  * a warm-up stage (`--warmup-frac`, default 20 % of the epochs) trains without the causal
+    constraints and without the counterfactual loss, so the model learns semantics first;
+  * then those terms ramp in linearly (`--ramp-frac`, default 30 %).
+* `--curriculum full` adds a competence-based data curriculum (Platanios et al., NAACL 2019):
+  * epoch t trains only on the easiest `c(t)` share of the questions, where
+    `c(t) = sqrt(c0^2 + (1 - c0^2) t / T)` and `c0 = --competence-start` (default 0.3);
+  * difficulty = question length + relational question + answer type (yes/no < other < number);
+  * counterfactual examples are ordered too: irrelevant < existence < counting < replacement.
+* The training log and `training_history_<tag>.csv` show the weights, the stage and the
+  competence for every epoch.
+
+### 2. Neuro-symbolic knowledge (`models/knowledge.py`, `models/symbolic.py`)
+
+> *"... integrating external symbolic knowledge bases or neuro symbolic reasoning modules ..."*
+
+* **Knowledge base `K[a, b, r]`** for every ordered pair of COCO classes (a, b):
+  * relations: co-occurrence PMI, touches, overlaps, above, below, inside, near;
+  * estimated from the COCO instance annotations, with Bayesian smoothing. **The validation
+    images are excluded**, so nothing leaks into the evaluation;
+  * an `external` channel holds triples from any TSV file (`subject<TAB>relation<TAB>object<TAB>confidence`),
+    e.g. ConceptNet, Visual Genome relationships or hand-written rules;
+  * every entry can be printed as a symbolic triple, such as `(person, above, bicycle) 0.98`.
+* **Knowledge prior on the edges** (`--knowledge-prior builtin`): for a candidate edge j -> i,
+  the graph adds `gate * MLP([K[c_i, c_j] ; K[c_j, c_i]])` to the edge logit.
+  * The MLP and the gate are learned; K is a buffer, saved in the checkpoint.
+  * Works with the soft and the discrete graph.
+* **Symbolic answer fusion** (`--symbolic-fusion`):
+  * a rule-based reasoner (`models/scene_answer.py`) answers counting, existence, colour and
+    spatial questions from the detected scene;
+  * its answer becomes evidence `e` over the answer vocabulary, fused as
+    `logits' = logits + softplus(w^T q + b) * e`;
+  * the gate depends on the question, so the model learns which question types to trust the
+    rules for. Questions the rules cannot parse leave the neural answer unchanged;
+  * under do() the symbolic answer is recomputed on the edited scene. Removing the only dog turns
+    "Is there a dog?" into "no" in the symbolic path too. This holds in training, in the
+    evaluation and in `whatif_qa.py`.
+
+```bash
+python build_knowledge_base.py --coco-instances coco/annotations/instances_train2014.json --exclude-val
+python train.py --samples 30000 --epochs 10 --graph-mode discrete \
+    --loss-weighting uncertainty --curriculum full --knowledge-prior builtin --symbolic-fusion --tag fw_all
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--loss-weighting {fixed,uncertainty,dwa}` | fixed | adaptive objective weights |
+| `--curriculum {none,staged,full}` | none | staged regularisation (+ data curriculum) |
+| `--warmup-frac`, `--ramp-frac` | 0.2, 0.3 | stage lengths (share of epochs) |
+| `--competence-start` | 0.3 | share of the easiest questions in epoch 1 |
+| `--knowledge-prior {none,builtin}` | none | class-pair knowledge prior on the edges |
+| `--knowledge-file` | | saved knowledge base (`*.pt`) instead of building it |
+| `--external-knowledge` | | TSV of extra triples |
+| `--symbolic-fusion` | off | gated rule-based answer fusion |
+
+Checks on fake data (stubbed DETR/BERT, discrete graph, 6 epochs, 60 validation questions and
+68 validation counterfactual examples). **These are not evidence about real VQA.**
+
+| run (3 seeds, mean ± std) | factual acc. | counterfactual acc. | DAG |
+|---|---|---|---|
+| discrete (baseline) | 88.9 ± 1.0 | 81.4 ± 9.8 | 100 % |
+| + uncertainty weighting + full curriculum | 75.0 ± 2.9 | 76.5 ± 10.3 | 100 % |
+| + knowledge prior + symbolic fusion | 93.3 ± 2.9 | 99.5 ± 0.8 | 100 % |
+| + all four | 93.9 ± 1.9 | 100.0 ± 0.0 | 100 % |
+
+Single components, seed 42 only. The baseline with that seed scores 88.3 / 89.7.
+
+| component | factual | counterfactual |
+|---|---|---|
+| uncertainty weighting | 88.3 | 86.8 |
+| DWA | 83.3 | 88.2 |
+| staged regularisation | 85.0 | 70.6 |
+| full curriculum | 81.7 | 92.6 |
+| knowledge prior | 83.3 | 82.4 |
+| symbolic fusion | 85.0 | 100.0 |
+
+How to read this:
+
+* **Symbolic fusion causes almost all of the gain.** The fake questions are templates
+  ("Is there a dog?", "How many cars ...") that the rules parse perfectly, so this is a best case.
+  On real VQA the rules apply to fewer questions and the detections are noisy. The learned gate is
+  meant to handle that, but the size of the effect has to be measured on VQA v2.
+* **The knowledge prior has no measurable effect here.** The fake knowledge base comes from only
+  108 annotated images and 6 classes. Its value should come from the full COCO statistics.
+* **Adaptive weighting and the curriculum do not help in 6 epochs.** Staged regularisation switches
+  the counterfactual loss off in epoch 1 and ramps it in over epochs 2–3, so a short run loses
+  counterfactual training. The data curriculum also shows the model fewer questions early on.
+  These methods are designed for longer training, so test them with the 10-epoch Colab runs
+  (notebook, section 13).
+* With 60 / 68 validation items, one question is 1.7 / 1.5 points, and the seed-to-seed spread of
+  the counterfactual accuracy is about ±10 points. Single-seed differences are noise.
+
+---
+
 # SCM-VLM Research Prototype
 
 Implementation of the core architecture proposed in:

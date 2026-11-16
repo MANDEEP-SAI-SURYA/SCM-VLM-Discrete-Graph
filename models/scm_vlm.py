@@ -10,7 +10,7 @@ from configs.config import (
 )
 
 from models.causal_attention import CausalAttentionBlock
-from models.intervention import InterventionEngine, find_descendants
+from models.intervention import InterventionEngine, find_descendants, influenced_nodes
 from models.scm_graph import SCMGraph, pairwise_box_features
 from models.text_encoder import TextEncoder
 from models.vision_encoder import VisionEncoder
@@ -77,30 +77,49 @@ class SCMVLM(nn.Module):
                  question_aware: bool = True, graph_mode: str = "soft", graph_top_k: int = 3,
                  graph_geometry: bool = True, node_identity: bool = True,
                  relation_messages: bool = True, relation_types: int = 1,
-                 residual_last_block: bool = True):
+                 residual_last_block: bool = True, graph_temperature: float = 1.0,
+                 diagnostic_messages: bool | None = None, knowledge_prior: bool = False,
+                 symbolic_fusion: bool = False):
         """
-        graph_mode           "soft" (learned top-k graph), "legacy" (old hard-threshold graph,
-                             old checkpoints) or "none" (ablation: no graph, no messages;
-                             nodes are processed independently, everything else identical)
+        graph_mode           "soft" (learned top-k graph), "discrete" (Discrete Causal Graph
+                             Sampling: discrete parent sets with a "no parent" option, Gumbel
+                             top-k while training, deterministic at test time), "legacy" (old
+                             hard-threshold graph, old checkpoints) or "none" (ablation: no graph,
+                             no messages; nodes are processed independently, everything else
+                             identical)
+        graph_temperature    Gumbel-softmax temperature of the discrete graph (annealed by train.py)
+        diagnostic_messages  child -> parent messages along the same edges (Pearl-style belief
+                             propagation); default: on for the discrete graph, off otherwise
         node_identity        node input = [DETR embedding ; class embedding ; box]
         relation_messages    messages depend on the (parent, child) pair geometry
         relation_types       R > 1: learned relation types, one message transform each
         residual_last_block  False removes the residual bypass of the last message step,
                              so the answer cannot ignore messages
+        knowledge_prior      add a symbolic class-pair prior from a knowledge base to the edge
+                             scores (models/knowledge.py; soft / discrete graph only)
+        symbolic_fusion      fuse the answer logits with a rule-based symbolic answer computed
+                             on the scene (models/symbolic.py), through a learned question gate
         """
         super().__init__()
 
-        if graph_mode not in ("soft", "legacy", "none"):
-            raise ValueError("graph_mode must be 'soft', 'legacy' or 'none'")
+        if graph_mode not in ("soft", "legacy", "none", "discrete"):
+            raise ValueError("graph_mode must be 'soft', 'legacy', 'none' or 'discrete'")
         self.question_aware = question_aware
         self.graph_mode = graph_mode
         self.node_identity = node_identity
         # relation-aware messages need box geometry; the legacy graph has none
-        self.relation_messages = relation_messages and graph_mode == "soft"   # needs the box-geometry graph
-        self.relation_types = relation_types if (self.relation_messages and graph_mode == "soft") else 1
+        learned_graph = graph_mode in ("soft", "discrete")     # graphs with box geometry
+        self.relation_messages = relation_messages and learned_graph   # needs the box-geometry graph
+        self.relation_types = relation_types if (self.relation_messages and learned_graph) else 1
         self.residual_last_block = residual_last_block
+        if diagnostic_messages is None:
+            diagnostic_messages = graph_mode == "discrete"
+        self.diagnostic_messages = bool(diagnostic_messages) and self.relation_messages
         self.graph_top_k = graph_top_k
-        self.graph_geometry = graph_geometry and graph_mode == "soft"
+        self.graph_geometry = graph_geometry and learned_graph
+        self.knowledge_prior = bool(knowledge_prior) and learned_graph
+        self.symbolic_fusion = bool(symbolic_fusion)
+        self.symbolic = None          # SymbolicAnswerer, set by set_answer_vocab()
 
         # -------------------------
         # ENCODERS
@@ -131,9 +150,15 @@ class SCMVLM(nn.Module):
         # -------------------------
         # GRAPH
         # -------------------------
-        if graph_mode == "soft":
+        if graph_mode == "discrete":
+            # Discrete Causal Graph Sampling (models/scm_graph.py, SCMGraph._discrete_parents)
+            self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM, top_k=graph_top_k, threshold=0.0, mode="discrete",
+                                  geometry=self.graph_geometry, relation_types=self.relation_types,
+                                  temperature=graph_temperature, knowledge=self.knowledge_prior)
+        elif graph_mode == "soft":
             self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM, top_k=graph_top_k, threshold=0.0, mode="soft",
-                                  geometry=self.graph_geometry, relation_types=self.relation_types)
+                                  geometry=self.graph_geometry, relation_types=self.relation_types,
+                                  knowledge=self.knowledge_prior)
         elif graph_mode == "legacy":   # checkpoints trained before the collapse fix
             self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM, mode="legacy")
         else:
@@ -148,6 +173,7 @@ class SCMVLM(nn.Module):
                 relation_messages=self.relation_messages,
                 relation_types=self.relation_types,
                 residual_messages=residual_last_block or index < num_layers - 1,
+                diagnostic=self.diagnostic_messages,
             )
             for index in range(num_layers)
         ])
@@ -165,6 +191,11 @@ class SCMVLM(nn.Module):
                 nn.ReLU(),
                 nn.Linear(512, num_classes),
             )
+
+        if self.symbolic_fusion:
+            from models.symbolic import SymbolicFusion
+
+            self.symbolic_gate = SymbolicFusion(QUESTION_DIM)
 
         # -------------------------
         # INTERVENTION ENGINE
@@ -184,7 +215,51 @@ class SCMVLM(nn.Module):
             "relation_messages": self.relation_messages,
             "relation_types": self.relation_types,
             "residual_last_block": self.residual_last_block,
+            "diagnostic_messages": self.diagnostic_messages,
+            "knowledge_prior": self.knowledge_prior,
+            "symbolic_fusion": self.symbolic_fusion,
+            # Gumbel temperature reached at the end of training (discrete graph only)
+            "graph_temperature": float(getattr(self.graph, "temperature", 1.0)) if self.graph is not None else 1.0,
         }
+
+    # =====================================================
+    # NEURO-SYMBOLIC KNOWLEDGE
+    # =====================================================
+    def set_knowledge(self, knowledge: torch.Tensor) -> None:
+        """Load the class-pair knowledge base K [92, 92, R] (models/knowledge.py)."""
+        if self.graph is None or self.graph.knowledge_prior is None:
+            raise ValueError("This model was built without knowledge_prior=True.")
+        self.graph.knowledge_prior.set_knowledge(knowledge)
+
+    def set_answer_vocab(self, idx2answer) -> None:
+        """Answer vocabulary for the symbolic reasoner (symbolic_fusion=True)."""
+        if self.symbolic_fusion:
+            from models.symbolic import SymbolicAnswerer
+
+            self.symbolic = SymbolicAnswerer(idx2answer)
+
+    def symbolic_evidence(self, question: str, labels, boxes=None):
+        """[1, C] symbolic evidence for ``question`` on the scene (labels, boxes 0-1), or None
+        when symbolic fusion is off."""
+        if not self.symbolic_fusion or self.symbolic is None or question is None:
+            return None
+        if boxes is not None and hasattr(boxes, "detach"):
+            boxes = boxes.detach().cpu().reshape(-1, 4).tolist()
+        return self.symbolic.evidence(question, list(labels), boxes, device=self.symbolic_gate.gate.weight.device)
+
+    def counterfactual_evidence(self, question: str, labels, boxes, kind: str, nodes, new_label=None):
+        """Symbolic evidence recomputed on the scene AFTER the intervention."""
+        if not self.symbolic_fusion or self.symbolic is None:
+            return None
+        from models.symbolic import edited_scene
+
+        cf_labels, cf_boxes = edited_scene(labels, boxes, kind, nodes, new_label)
+        return self.symbolic_evidence(question, cf_labels, cf_boxes)
+
+    def fuse(self, logits, question_embedding, symbolic_prior):
+        if not self.symbolic_fusion or symbolic_prior is None:
+            return logits
+        return self.symbolic_gate(logits, question_embedding, symbolic_prior)
 
     # =====================================================
     # NODE INPUT
@@ -217,13 +292,15 @@ class SCMVLM(nn.Module):
     # =====================================================
     # GRAPH
     # =====================================================
-    def build_graph(self, objects, question_embedding, boxes=None):
+    def build_graph(self, objects, question_embedding, boxes=None, class_ids=None):
         if objects.dim() == 2:
             objects = objects.unsqueeze(0)
         if self.graph is None:
             B, N, _ = objects.shape
             zeros = objects.new_zeros(B, N, N)
             return {"adjacency": zeros, "probs": zeros, "relation_probs": None, "geometry": None}
+        if self.knowledge_prior:
+            return self.graph(objects, question_embedding, boxes, class_ids=class_ids)
         return self.graph(objects, question_embedding, boxes)
 
     def normalise(self, adjacency):
@@ -295,13 +372,15 @@ class SCMVLM(nn.Module):
         return output
 
     def forward_features(self, raw_objects, question_embedding, boxes=None, class_ids=None,
-                         messages=True, adjacency_override=None, relation_probs_override=None):
+                         messages=True, adjacency_override=None, relation_probs_override=None,
+                         symbolic_prior=None):
         """Same as forward() but from pre-computed DETR object embeddings [B, N, OBJECT_DIM],
         BERT question embeddings [B, QUESTION_DIM], boxes [B, N, 4] scaled to 0-1 and DETR
         class ids [B, N] (used by the cached training loop).
 
         messages=False and adjacency_override (e.g. a scrambled graph) are used by the
-        graph knock-out analysis."""
+        graph knock-out analysis.  symbolic_prior [B, C]: evidence of the symbolic reasoner
+        (model.symbolic_evidence), fused into the logits when symbolic_fusion=True."""
 
         if raw_objects.dim() == 2:
             raw_objects = raw_objects.unsqueeze(0)
@@ -314,7 +393,7 @@ class SCMVLM(nn.Module):
 
         objects = self.encode_nodes(raw_objects, class_ids, boxes)
 
-        graph_output = self.build_graph(objects, question_embedding, boxes)
+        graph_output = self.build_graph(objects, question_embedding, boxes, class_ids)
 
         adjacency = graph_output["adjacency"] if adjacency_override is None else adjacency_override
         relation_probs = graph_output["relation_probs"]
@@ -326,11 +405,19 @@ class SCMVLM(nn.Module):
         )
 
         logits, answer_attention = self.decode(hidden, question_embedding, return_attention=True)
+        neural_logits = logits
+        logits = self.fuse(logits, question_embedding, symbolic_prior)
 
         return {
             "logits": logits,
+            "neural_logits": neural_logits,
+            "symbolic_prior": symbolic_prior,
             "adjacency": adjacency,
             "edge_probs": graph_output["probs"],
+            "null_weight": graph_output.get("null_weight"),
+            "candidate_logits": graph_output.get("candidate_logits"),
+            "allowed_parents": graph_output.get("allowed_parents"),
+            "causal_order": graph_output.get("causal_order"),
             "relation_probs": relation_probs,
             "objects": objects,
             "raw_objects": raw_objects,
@@ -345,7 +432,7 @@ class SCMVLM(nn.Module):
     # =====================================================
     # INTERVENTIONS (differentiable; used by training and evaluation)
     # =====================================================
-    def intervene(self, out, kind, nodes, new_raw=None, new_class_ids=None, mode="do"):
+    def intervene(self, out, kind, nodes, new_raw=None, new_class_ids=None, mode="do", symbolic_prior=None):
         """Apply an intervention to a factual ``forward_features`` output (batch size 1).
 
         kind="remove":  delete the nodes and all their edges from the scene.  With
@@ -356,6 +443,9 @@ class SCMVLM(nn.Module):
                         incoming edges of k are cut and the rest of the graph is kept, so only
                         k's descendants change.
         mode="recompute" rebuilds the graph on the edited scene instead (scene edit).
+
+        symbolic_prior: symbolic evidence recomputed on the EDITED scene (symbolic_fusion=True;
+        None = no symbolic evidence for the counterfactual).
 
         Returns a dict like forward_features plus ``keep`` (factual index of every node in the
         edited scene, or None for replace) and ``descendants``.
@@ -375,7 +465,13 @@ class SCMVLM(nn.Module):
             keep = [i for i in range(n) if i not in nodes]
             if not keep:
                 raise ValueError("Removing every object leaves an empty scene.")
-            descendants = sorted({d for k in nodes for d in find_descendants(adjacency[0], k)} - set(nodes))
+            if self.diagnostic_messages:
+                graph = adjacency[0].detach().cpu() > 1e-8
+                neighbours = sorted({int(m) for k in nodes for m in torch.nonzero(graph[:, k] | graph[k, :]).flatten()
+                                     if int(m) not in nodes})
+                descendants = sorted(set(neighbours) | set(influenced_nodes(adjacency[0], neighbours, True, nodes)))
+            else:
+                descendants = sorted({d for k in nodes for d in find_descendants(adjacency[0], k)} - set(nodes))
             index = torch.tensor(keep, device=objects.device)
             new_objects = objects.index_select(1, index)
             new_adjacency = self.normalise(adjacency.index_select(1, index).index_select(2, index))
@@ -404,12 +500,13 @@ class SCMVLM(nn.Module):
             if class_ids is not None:
                 class_ids = class_ids.clone()
                 class_ids[0, nodes] = new_class[0]
-            descendants = sorted({d for k in nodes for d in find_descendants(new_adjacency[0], k)} - set(nodes))
+            descendants = (influenced_nodes(new_adjacency[0], nodes, True) if self.diagnostic_messages else
+                           sorted({d for k in nodes for d in find_descendants(new_adjacency[0], k)} - set(nodes)))
         else:
             raise ValueError(f"unknown intervention kind: {kind}")
 
         if mode == "recompute":
-            graph_output = self.build_graph(new_objects, q, boxes)
+            graph_output = self.build_graph(new_objects, q, boxes, class_ids)
             new_adjacency = graph_output["adjacency"]
             relation_probs = graph_output["relation_probs"]
         elif mode != "do":
@@ -417,8 +514,11 @@ class SCMVLM(nn.Module):
 
         hidden, _ = self.run_causal_layers(new_objects, new_adjacency, boxes, relation_probs)
         logits, answer_attention = self.decode(hidden, q, return_attention=True)
+        neural_logits = logits
+        logits = self.fuse(logits, q, symbolic_prior)
         return {
             "logits": logits,
+            "neural_logits": neural_logits,
             "adjacency": new_adjacency,
             "relation_probs": relation_probs,
             "objects": new_objects,

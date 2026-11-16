@@ -93,7 +93,9 @@ def bootstrap_diff_ci(first, second, n_boot: int = 1000, seed: int = 0) -> dict:
 # model passes
 # =====================================================================
 
-def _forward(model, detections, q_emb, **kwargs):
+def _forward(model, detections, q_emb, question=None, **kwargs):
+    if question is not None and getattr(model, "symbolic_fusion", False):
+        kwargs["symbolic_prior"] = model.symbolic_evidence(question, detections["labels"], detections["boxes"])
     return model.forward_features(
         detections["embeddings"].unsqueeze(0).to(DEVICE), q_emb.unsqueeze(0).to(DEVICE),
         detections["boxes"].unsqueeze(0).to(DEVICE), detections["label_ids"].unsqueeze(0).to(DEVICE), **kwargs)
@@ -134,7 +136,7 @@ def factual_predictions(model, dataset, indices, cache, seed: int = 0) -> pd.Dat
             if len(detections["labels"]) == 0:
                 continue
             q_emb = cache.question(question)
-            out = _forward(model, detections, q_emb)
+            out = _forward(model, detections, q_emb, question)
         except Exception as error:
             print(f"EVAL SKIP {image_path}: {error}")
             continue
@@ -145,9 +147,9 @@ def factual_predictions(model, dataset, indices, cache, seed: int = 0) -> pd.Dat
             "pred_learned": int(out["logits"].argmax(-1)),
         }
         if model.graph is not None:
-            off = _forward(model, detections, q_emb, messages=False)
+            off = _forward(model, detections, q_emb, question, messages=False)
             scrambled_a, scrambled_r = scramble_graph(out["adjacency"], out["relation_probs"], rng)
-            scrambled = _forward(model, detections, q_emb, adjacency_override=scrambled_a,
+            scrambled = _forward(model, detections, q_emb, question, adjacency_override=scrambled_a,
                                  relation_probs_override=scrambled_r)
             row["pred_messages_off"] = int(off["logits"].argmax(-1))
             row["pred_scrambled"] = int(scrambled["logits"].argmax(-1))
@@ -167,11 +169,15 @@ def counterfactual_predictions(model, examples, cache, answer2idx, irrelevant_gr
     rows = []
     for example in examples:
         detections = cache.image(example["image_path"])
-        out = _forward(model, detections, cache.question(example["question"]))
+        out = _forward(model, detections, cache.question(example["question"]), example["question"])
         related = (model.graph is not None and irrelevant_is_related(out, detections, example))
         new_raw = example["x_prime"].to(DEVICE) if example["kind"] == "replace" else None
         new_ids = [example["new_label_id"]] * len(example["nodes"]) if example["kind"] == "replace" else None
-        cf = model.intervene(out, example["kind"], example["nodes"], new_raw=new_raw, new_class_ids=new_ids)
+        cf_prior = (model.counterfactual_evidence(example["question"], detections["labels"], detections["boxes"],
+                                                  example["kind"], example["nodes"], example.get("new_label"))
+                    if getattr(model, "symbolic_fusion", False) else None)
+        cf = model.intervene(out, example["kind"], example["nodes"], new_raw=new_raw, new_class_ids=new_ids,
+                             symbolic_prior=cf_prior)
         factual_pred = int(out["logits"].argmax(-1))
         cf_pred = int(cf["logits"].argmax(-1))
         answer_attention = float("nan")
@@ -217,6 +223,55 @@ def edge_probe(model, dataset, indices, cache, max_images: int = 2000) -> dict:
             far.append(float(stats["p_far"]))
     return {"edge_prob_touching": bootstrap_ci(contact), "edge_prob_distant": bootstrap_ci(far),
             "touching_minus_distant": bootstrap_diff_ci(contact, far)}
+
+
+@torch.no_grad()
+def graph_structure(model, dataset, indices, cache, max_images: int = 2000, noise: float = 0.05,
+                    edge_threshold: float = 0.05, seed: int = 0) -> dict:
+    """Structure of the learned graph on held-out images (one question per image):
+
+    acyclicity_h      NOTEARS h(A) = tr(exp(A o A)) - n   (0 for a DAG)
+    dag_rate          share of scenes whose graph is acyclic (h(A) < 1e-3)
+    root_fraction     share of objects with no incoming edge weight (root causes)
+    parents_per_node  edges with weight > edge_threshold per object
+    stability         Jaccard overlap of the edge set before / after adding small Gaussian noise
+                      (noise * std) to the DETR embeddings: 1 = the structure does not change
+    no_parent_weight  weight of the "no parent" option (discrete graph only)
+    """
+    from losses.losses import acyclicity_loss
+
+    if model.graph is None:
+        return {}
+    model.eval()
+    generator = torch.Generator().manual_seed(seed)
+    seen = set()
+    rows = {k: [] for k in ("acyclicity_h", "dag", "root_fraction", "parents_per_node", "stability",
+                            "no_parent_weight")}
+    for index in indices:
+        image_path, question, _ = dataset[index]
+        if image_path in seen or len(seen) >= max_images:
+            continue
+        seen.add(image_path)
+        detections = cache.image(image_path)
+        if len(detections["labels"]) < 2:
+            continue
+        q_emb = cache.question(question)
+        out = _forward(model, detections, q_emb)
+        A = out["adjacency"][0].float()
+        h = float(acyclicity_loss(A))
+        rows["acyclicity_h"].append(h)
+        rows["dag"].append(100.0 * (h < 1e-3))
+        rows["root_fraction"].append(100.0 * float((A.sum(-1) < edge_threshold).float().mean()))
+        edges = A > edge_threshold
+        rows["parents_per_node"].append(float(edges.sum(-1).float().mean()))
+        if out.get("null_weight") is not None:
+            rows["no_parent_weight"].append(float(out["null_weight"][0].mean()))
+        raw = detections["embeddings"]
+        noisy = dict(detections, embeddings=raw + noise * raw.std() * torch.randn(raw.shape, generator=generator))
+        edges_noisy = _forward(model, noisy, q_emb)["adjacency"][0] > edge_threshold
+        union = (edges | edges_noisy).sum()
+        rows["stability"].append(1.0 if int(union) == 0 else float((edges & edges_noisy).sum() / union))
+    return {key: bootstrap_ci(values) for key, values in rows.items() if values}
 
 
 # =====================================================================
@@ -288,6 +343,8 @@ def run_full_evaluation(model, dataset, val_idx, cache, val_cf, tag=None, result
     summary["graph_knockout"] = knockout
 
     # 4. relation probes
+    summary["graph_structure"] = graph_structure(model, dataset, val_idx, cache, seed=seed)
+
     probes = {"edges": edge_probe(model, dataset, val_idx, cache)}
     if len(cf_table):
         used = cf_table
@@ -331,6 +388,9 @@ def _print_summary(summary: dict) -> None:
             print(f"Knock-out {variant:<12}: accuracy {entry['accuracy']:.2f}{extra}")
         else:
             print(f"Knock-out: {entry}")
+    structure = summary.get("graph_structure") or {}
+    if structure:
+        print("Graph structure: " + ", ".join(f"{k} {_fmt_ci(v)}" for k, v in structure.items()))
     probes = summary["relation_probes"]
     if probes.get("edges"):
         print(f"Edge prob touching {_fmt_ci(probes['edges']['edge_prob_touching'])} vs distant "

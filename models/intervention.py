@@ -56,3 +56,28 @@ class InterventionEngine:
             descendant_sets.append(find_descendants(intervened_adjacency[batch_index], node))
 
         return intervened_objects, intervened_adjacency, descendant_sets
+
+
+def influenced_nodes(adjacency: torch.Tensor, sources: list[int], diagnostic: bool,
+                     excluded: list[int] | None = None, threshold: float = 1e-8) -> list[int]:
+    """Nodes whose state can change when ``sources`` change, in the (mutilated) graph.
+
+    Causal messages only (parent -> child): the descendants of the sources.
+    With diagnostic messages (child -> parent as well, Pearl-style belief propagation) evidence
+    flows along edges in both directions, so every node connected to a source by an undirected
+    path can change (e.g. co-parents of a common child: "explaining away").  ``excluded`` nodes
+    (e.g. removed objects) are not traversed."""
+    graph = adjacency.detach().cpu() > threshold
+    if diagnostic:
+        graph = graph | graph.T
+    excluded = set(excluded or [])
+    seen: set[int] = set()
+    queue = [s for s in sources if s not in excluded]
+    while queue:
+        current = queue.pop(0)
+        neighbours = torch.nonzero(graph[:, current], as_tuple=False).flatten().tolist()
+        for node in neighbours:
+            if node not in seen and node not in sources and node not in excluded:
+                seen.add(node)
+                queue.append(node)
+    return sorted(seen)

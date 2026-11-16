@@ -318,7 +318,9 @@ def main() -> None:
     print(f"Mode              : {args.mode}" + (" (relations re-calculated on the edited scene)"
                                                    if args.mode == "recompute" else " (strict SCM do())"))
     if args.mode == "do":
-        print(f"Descendants       : {', '.join(summary['descendants']) or 'none (no downstream effect)'}")
+        label = ("Influenced nodes  " if getattr(reasoner.model, "diagnostic_messages", False)
+                 else "Descendants       ")       # diagnostic messages: evidence also flows to parents
+        print(f"{label}: {', '.join(summary['descendants']) or 'none (no downstream effect)'}")
         print(f"Unaffected nodes  : {summary['unaffected_nodes']} (factual values kept, drift="
               f"{summary['non_descendant_max_drift']:.2e})")
     for node, info in summary["steering"].items():

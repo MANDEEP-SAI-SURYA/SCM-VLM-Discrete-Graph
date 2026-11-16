@@ -66,7 +66,7 @@ def contact_targets(boxes: torch.Tensor, gap: float = CONTACT_GAP) -> torch.Tens
 class SCMGraph(nn.Module):
 
     def __init__(self, object_dim, question_dim, hidden_dim=512, top_k=2, threshold=0.5, mode="legacy",
-                 geometry=False, relation_types=1):
+                 geometry=False, relation_types=1, temperature=1.0, knowledge=False):
         """mode:
         * "soft"   - every node attends over its top_k most likely parents; the weights are
                      the edge probabilities normalised to sum to 1 (no hard cut-off).  The
@@ -76,11 +76,23 @@ class SCMGraph(nn.Module):
         * "legacy" - original behaviour: top_k, hard threshold, rows normalised to sum 1.
                      Edges below the threshold get no gradient; checkpoints trained this
                      way ended with an empty graph.
+        * "discrete" - Discrete Causal Graph Sampling (see _discrete_parents): every node
+                     chooses its parents as a discrete set (Gumbel top-k during training,
+                     deterministic top-k at test time) among the other objects AND a learnable
+                     "no parent" (exogenous) option.  Unlike "soft", a node can be a root
+                     cause, so the graph can be a true DAG.
         """
         super().__init__()
-        if mode not in ("soft", "legacy"):
-            raise ValueError("mode must be 'soft' or 'legacy'")
+        if mode not in ("soft", "legacy", "discrete"):
+            raise ValueError("mode must be 'soft', 'legacy' or 'discrete'")
         self.mode = mode
+        # Gumbel-softmax temperature (annealed by train.py; also used at test time so the
+        # edge weights keep the sharpness they were trained with)
+        self.temperature = float(temperature)
+        # sample=True: stochastic Gumbel sampling while training; test time is deterministic
+        self.sample = True
+        # discrete graph: chosen parents below this weight are dropped (exact zeros)
+        self.min_edge_weight = 1e-3
         # geometry=True: the edge scorer also sees the pair's box geometry (pairwise_box_features)
         self.geometry = geometry
 
@@ -103,11 +115,32 @@ class SCMGraph(nn.Module):
                 nn.Linear(GEOMETRY_DIM + 32, 64), nn.ReLU(), nn.Linear(64, self.relation_types)
             )
 
+        if mode == "discrete":
+            # exogeneity scorer: logit of "this object has NO parent in the scene" (a root
+            # cause), computed from the object and the question
+            self.null_mlp = nn.Sequential(
+                nn.Linear(object_dim * 2, 128), nn.ReLU(), nn.Linear(128, 1)
+            )
+            # causal-order scorer: an object can only be a parent of objects later in the order,
+            # which makes every sampled graph a DAG
+            self.order_mlp = nn.Sequential(
+                nn.Linear(object_dim * 2, 128), nn.ReLU(), nn.Linear(128, 1)
+            )
+
+        # knowledge=True: symbolic class-pair prior from a knowledge base (models/knowledge.py)
+        # added to the edge logits; needs the DETR class ids of the objects
+        self.knowledge_prior = None
+        if knowledge:
+            from models.knowledge import KnowledgePrior
+
+            self.knowledge_prior = KnowledgePrior()
+
         self.top_k = top_k
         self.threshold = threshold
 
-    def forward(self, objects, question, boxes=None):
-        """boxes: [B, N, 4] or [N, 4] (x0, y0, x1, y1 scaled to 0-1); used when geometry=True."""
+    def forward(self, objects, question, boxes=None, class_ids=None):
+        """boxes: [B, N, 4] or [N, 4] (x0, y0, x1, y1 scaled to 0-1); used when geometry=True.
+        class_ids: [B, N] or [N] DETR class ids; used by the knowledge prior."""
 
         if objects.dim() == 2:
             objects = objects.unsqueeze(0)
@@ -144,6 +177,13 @@ class SCMGraph(nn.Module):
                 pair = self.type_pair(target * source)
                 relation_probs = torch.softmax(self.type_mlp(torch.cat([geometry, pair], dim=-1)), dim=-1)
 
+        knowledge_logits = None
+        if self.knowledge_prior is not None and class_ids is not None:
+            if class_ids.dim() == 1:
+                class_ids = class_ids.unsqueeze(0)
+            knowledge_logits = self.knowledge_prior(class_ids.to(objects.device))
+            scores = scores + knowledge_logits
+
         # -------------------------
         # remove self loops
         # -------------------------
@@ -151,6 +191,22 @@ class SCMGraph(nn.Module):
         scores = scores.masked_fill(eye.unsqueeze(0), -1e9)
 
         probs = torch.sigmoid(scores)
+
+        if self.mode == "discrete":
+            sampled = self._discrete_parents(scores, objects, q)
+            adjacency = sampled["adjacency"]
+            return {
+                "candidate_logits": sampled["candidate_logits"],  # [B, N, N + 1], last = "no parent"
+                "allowed_parents": sampled["allowed"],            # [B, N, N] causal-order mask
+                "causal_order": sampled["order"],                 # [B, N] order scores
+                "adjacency": adjacency,
+                "hard_adjacency": (adjacency.detach() > 0).float(),
+                "probs": probs,
+                "scores": scores,
+                "null_weight": sampled["null_weight"],            # [B, N] weight of "no parent"
+                "relation_probs": relation_probs,
+                "geometry": geometry,
+            }
 
         # -------------------------
         # SAFE TOP-K (IMPORTANT FIX)
@@ -187,6 +243,70 @@ class SCMGraph(nn.Module):
             "geometry": geometry,                 # [B, N, N, GEOMETRY_DIM] or None
         }
 
+    def _discrete_parents(self, scores, objects, q) -> dict:
+        """Discrete Causal Graph Sampling with a learned causal order.
+
+        1. Causal order.  Every object gets an order score r_i = order_mlp([o_i ; q]).  While
+           training r is perturbed with Gumbel noise (a sampled permutation, i.e. a sampled
+           causal order); at test time it is deterministic.  Object j may only be a parent of
+           object i if it comes earlier in the order (r_j > r_i).  Every sampled graph is
+           therefore a DAG by construction - acyclicity is guaranteed, not just penalised -
+           and the first object in the order is a root.
+
+        2. Parent sets.  Candidates of node i: the objects allowed by the order (edge logits
+           s_ij) and an exogenous "no parent" option (logit from null_mlp).  With temperature tau:
+
+               training:  z = s + log m + Gumbel noise      test:  z = s + log m
+               soft       = softmax(z_relaxed / tau)        (m relaxed: sigmoid((r_j - r_i) / tau))
+               hard       = top-k of z, weights renormalised over the chosen candidates
+               weights    = hard + (soft - stopgrad(soft))  straight-through estimator
+
+           The forward pass uses the discrete, order-respecting parent set; the gradient is that
+           of the relaxed distribution, so edge scores AND order scores keep learning.  The
+           "no parent" weight is dropped: rows of A sum to 1 - w_i0.
+
+        Returns adjacency [B, N, N], no-parent weight [B, N], candidate logits [B, N, N + 1]
+        (order-masked; used by the parent-selection supervision), the hard order mask
+        allowed[b, i, j] = "j may be a parent of i" and the order scores [B, N]."""
+        B, N, D = objects.shape
+        context = torch.cat([objects, q[:, None, :].expand(B, N, D)], dim=-1)
+        null_logit = self.null_mlp(context)                                   # [B, N, 1]
+        order = self.order_mlp(context).squeeze(-1)                           # [B, N]
+        sampling = self.training and self.sample
+        if sampling:
+            uniform = torch.rand_like(order).clamp(1e-9, 1.0 - 1e-9)
+            order = order - torch.log(-torch.log(uniform))
+        tau = max(self.temperature, 1e-3)
+        # ties are broken by index so the order is always a strict total order
+        tie_break = torch.arange(N, device=order.device, dtype=order.dtype) * 1e-6
+        ranked = order - tie_break
+        allowed = ranked[:, None, :] > ranked[:, :, None]                     # [B, i, j]: j before i
+        hard_mask = torch.where(allowed, 0.0, -1e9).to(scores.dtype)
+        soft_mask = torch.nn.functional.logsigmoid((order[:, None, :] - order[:, :, None]) / tau)
+        order_term = hard_mask + (soft_mask - soft_mask.detach()) if self.training else hard_mask
+        edge_logits = scores + order_term
+        candidates = torch.cat([edge_logits, null_logit], dim=-1)             # [B, N, N + 1]
+        k = min(self.top_k, N)                                                # N - 1 objects + "none"
+        if sampling:
+            uniform = torch.rand_like(candidates).clamp(1e-9, 1.0 - 1e-9)
+            perturbed = candidates - torch.log(-torch.log(uniform))
+        else:
+            perturbed = candidates
+        soft = torch.softmax(perturbed / tau, dim=-1)
+        chosen = torch.zeros_like(soft).scatter_(-1, torch.topk(perturbed, k=k, dim=-1).indices, 1.0)
+        chosen[..., :N] = chosen[..., :N] * allowed.to(chosen.dtype)        # never an order-violating edge
+        hard = soft * chosen
+        hard = hard / hard.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        # a chosen parent with negligible weight (possible at low temperature) is not an edge
+        hard = hard * (hard > self.min_edge_weight).to(hard.dtype)
+        weights = hard + (soft - soft.detach()) if self.training else hard
+        return {"adjacency": weights[..., :N], "null_weight": weights[..., N], "candidate_logits": candidates,
+                "allowed": allowed, "order": order}
+
     def normalise(self, adjacency):
-        """Row normalisation used by the message passing (also used after interventions)."""
+        """Row normalisation used by the message passing (also used after interventions).
+        Discrete graphs keep their weights (rows sum to 1 - no-parent weight); removing a
+        parent removes its weight instead of re-scaling the remaining parents."""
+        if self.mode == "discrete":
+            return adjacency / adjacency.sum(dim=-1, keepdim=True).clamp(min=1.0)
         return adjacency / (adjacency.sum(dim=-1, keepdim=True) + 1e-8)

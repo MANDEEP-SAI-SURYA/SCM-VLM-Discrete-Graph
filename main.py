@@ -56,6 +56,7 @@ def load_trained_model(checkpoint_path: str = CHECKPOINT_PATH, verbose: bool = T
     idx2answer = {
         int(index): answer for index, answer in checkpoint["idx2answer"].items()
     }
+    model.set_answer_vocab(idx2answer)       # symbolic fusion (no-op otherwise)
     model.eval()
     if verbose:
         print(
