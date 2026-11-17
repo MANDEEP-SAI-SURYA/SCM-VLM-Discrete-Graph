@@ -199,6 +199,21 @@ This version follows the requested research-prototype layout and includes:
 - evaluation utilities
 - graph visualization
 
+## No GPU on Colab? Use Kaggle (free) and download the data directly
+
+`kaggle_train.ipynb` runs the whole pipeline on a free Kaggle GPU: clone the repo, download the
+data, run the tests, do the training runs and compare them. It needs no Kaggle dataset, because
+`download_data.py` fetches everything from the official VQA / COCO sites:
+
+```bash
+python download_data.py --images 8000     # VQA v2 + COCO annotations + a fixed 8000-image subset (~1.6 GB)
+python validate_dataset.py
+```
+
+The image subset is fixed (seed 0), so all runs use the same images and the same split.
+Interrupted downloads can be restarted, and files already on disk are skipped. This also works
+on a laptop.
+
 ## Setup
 
 ```bash
