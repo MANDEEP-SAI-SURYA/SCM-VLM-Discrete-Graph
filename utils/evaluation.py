@@ -146,6 +146,11 @@ def factual_predictions(model, dataset, indices, cache, seed: int = 0) -> pd.Dat
             "relational": is_relational(question), "num_objects": len(detections["labels"]),
             "pred_learned": int(out["logits"].argmax(-1)),
         }
+        if getattr(model, "symbolic_fusion", False):
+            # neural part alone (without the symbolic answer) and whether the rules applied
+            row["pred_neural"] = int(out["neural_logits"].argmax(-1))
+            prior = out.get("symbolic_prior")
+            row["symbolic_applied"] = int(prior is not None and float(prior.sum()) > 0)
         if model.graph is not None:
             off = _forward(model, detections, q_emb, question, messages=False)
             scrambled_a, scrambled_r = scramble_graph(out["adjacency"], out["relation_probs"], rng)
@@ -180,6 +185,10 @@ def counterfactual_predictions(model, examples, cache, answer2idx, irrelevant_gr
                              symbolic_prior=cf_prior)
         factual_pred = int(out["logits"].argmax(-1))
         cf_pred = int(cf["logits"].argmax(-1))
+        neural = {}
+        if getattr(model, "symbolic_fusion", False):
+            neural = {"cf_correct_neural": int(int(cf["neural_logits"].argmax(-1)) == answer2idx[example["cf_answer"]]),
+                      "symbolic_applied": int(cf_prior is not None and float(cf_prior.sum()) > 0)}
         answer_attention = float("nan")
         if example.get("answer_node") is not None:
             n = out["answer_attention"].shape[-1]
@@ -195,6 +204,7 @@ def counterfactual_predictions(model, examples, cache, answer2idx, irrelevant_gr
             "related_in_graph": int(related),
             "excluded": int(irrelevant_graph_check and related),
             "answer_attention_ratio": answer_attention,
+            **neural,
         })
     return pd.DataFrame(rows)
 
@@ -301,6 +311,12 @@ def run_full_evaluation(model, dataset, val_idx, cache, val_cf, tag=None, result
     for flag, group in factual.groupby("relational"):
         acc["relational" if flag else "non_relational"] = _accuracy(group["correct_learned"])
     acc["overall_ci"] = bootstrap_ci(factual["correct_learned"] * 100.0)
+    if "correct_neural" in factual:
+        # symbolic fusion: the same model without the rule-based answer, and how often the rules applied
+        acc["overall_neural_only"] = _accuracy(factual["correct_neural"])
+        acc["symbolic_coverage"] = _accuracy(factual["symbolic_applied"])
+        no_rule = factual[factual["symbolic_applied"] == 0]
+        acc["questions_without_rule_answer"] = _accuracy(no_rule["correct_learned"])
     summary["factual_accuracy"] = acc
 
     # 2. counterfactual accuracy
@@ -323,6 +339,15 @@ def run_full_evaluation(model, dataset, val_idx, cache, val_cf, tag=None, result
         cf_acc["irrelevant_unrelated_in_graph"] = _accuracy(unrelated["cf_correct"])
         cf_acc["irrelevant_unrelated_in_graph_n"] = int(len(unrelated))
         cf_acc["irrelevant_related_in_graph_n"] = int(len(irrelevant) - len(unrelated))
+        if "cf_correct_neural" in cf_table:
+            # honest view of symbolic fusion: existence / counting examples are answered by the rules
+            # by construction, so also report the neural path alone and the examples without a rule answer
+            cf_acc["overall_neural_only"] = _accuracy(cf_table["cf_correct_neural"])
+            for kind in CF_TYPES:
+                cf_acc[f"{kind}_neural_only"] = _accuracy(cf_table[cf_table["type"] == kind]["cf_correct_neural"])
+            no_rule = cf_table[cf_table["symbolic_applied"] == 0]
+            cf_acc["without_rule_answer"] = _accuracy(no_rule["cf_correct"])
+            cf_acc["without_rule_answer_n"] = int(len(no_rule))
         summary["counterfactual_accuracy"] = cf_acc
 
     # 3. graph knock-out

@@ -66,6 +66,56 @@ Checks run on fake data (stubbed DETR/BERT, 3 seeds; **not evidence about real V
 
 Real accuracy has to be measured on VQA v2 (Colab notebook, section 12).
 
+## Round 2: fixes after the first real VQA v2 run
+
+The first Kaggle run (VQA v2, 30,000 questions, 10 epochs, one seed) found three problems.
+This section describes the fixes.
+
+**1. The discrete graph collapsed to an empty graph at test time.** On real data, every object chose
+"no parent" (root_fraction 100 %, parents_per_node 0), so "100 % DAG" was trivially true.
+
+* **Cause.** While training, Gumbel noise often lets an edge beat a slightly stronger "no parent"
+  logit, so the training log still showed edges. At test time there is no noise and the
+  temperature is low, so "no parent" wins every time and the graph is empty.
+* **Fix.** A collapse guard (`--root-target 0.5`, default on for the discrete graph) puts a hinge
+  penalty on the "no parent" probability of the **noise-free, test-time** graph. Below 50 % roots it
+  costs nothing; above, it pushes edges back. The log now prints this test-time no-parent weight
+  and warns when the graph empties.
+* **Fake-data check.** Without parent supervision the old code reproduces the exact real-data
+  symptom: 100 % roots, 0 parents per object. With the guard: 28 % roots, 0.91 parents per object.
+* **No cost with supervision on.** Over 3 seeds: factual 87.2 ± 6.3 vs 88.9 ± 1.0, counterfactual
+  87.8 ± 2.3 vs 81.4 ± 9.8. None of the paired differences is significant except one seed in favour
+  of the guard.
+
+**2. Symbolic fusion needs an honest metric.** Existence / counting what-ifs are answered by the
+rules by construction. The evaluation now also reports:
+
+* `overall_neural_only`: the same model with the rule answer removed;
+* `symbolic_coverage`: the share of questions the rules could answer;
+* `without_rule_answer`: accuracy on the questions and what-ifs the rules could not answer.
+
+On fake data the neural part alone scores far lower (factual 65 vs 90). With fusion, the network
+leans on the rules, so report both numbers.
+
+**3. One seed, no significance tests.** `compare_runs.py`:
+
+* groups seeds (`soft`, `soft_s1`, `soft_s2`) into mean ± std;
+* tests every run against the baseline of the same seed with an exact McNemar test, on identical
+  held-out questions and counterfactual examples, plus a bootstrap CI of the difference.
+
+```bash
+python compare_runs.py --baseline soft soft soft_s1 soft_neurosym soft_neurosym_s1 discrete discrete_s1
+```
+
+**New configuration.** `soft_neurosym` adds the knowledge prior + symbolic fusion to the soft graph,
+which has working edges and the best replacement score.
+
+`kaggle_train.ipynb` section 5 runs round 2:
+
+1. seed 42: `soft`, `soft_neurosym`, `discrete`;
+2. extra seeds;
+3. the comparison.
+
 ## New: adaptive loss weighting, curriculum and neuro-symbolic knowledge
 
 Two more items from the paper's Future Work. All of them are **off by default**: without the

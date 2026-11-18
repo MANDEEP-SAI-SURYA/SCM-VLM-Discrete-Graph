@@ -81,6 +81,8 @@ LAMBDA_CF_OLD = 0.1       # KL(cf || factual) under noise  (--cf-mode invariance
 LAMBDA_SPARSE = 0.01
 LAMBDA_ACYCLIC = 0.05
 LAMBDA_ENTROPY = 0.05
+LAMBDA_ROOT = 1.0         # discrete graph: keep the share of 'no parent' objects below ROOT_TARGET
+ROOT_TARGET = 0.5
 LAMBDA_EDGE = 0.5         # weak relation supervision: objects whose boxes touch should be linked
 GRAPH_TOP_K = 3
 TAU_START = 1.0           # Gumbel temperature of the discrete graph at the first epoch ...
@@ -324,6 +326,14 @@ def graph_terms(model, out, boxes, settings) -> tuple[dict, dict]:
         loss_parent = (parent_selection_loss(out["candidate_logits"][0], boxes, out["allowed_parents"][0])
                        if settings["lambda_edge"] > 0 else zero)
         terms["edge"] = loss_edge + loss_parent
+        # collapse guard: on real VQA data the 'no parent' option won for every object at test
+        # time (empty graph, no messages).  Hinge on the mean no-parent probability of the
+        # noise-free test-time graph: free below the target share of root causes, penalised
+        # above it, so the graph cannot empty out.
+        null_mean = out["test_null_weight"][0].mean()
+        target = settings.get("root_target", ROOT_TARGET)
+        if target is not None:
+            terms["root"] = torch.relu(null_mean - target)
     else:
         terms["edge"] = loss_edge
         terms["sparse"] = loss_sparse
@@ -333,6 +343,9 @@ def graph_terms(model, out, boxes, settings) -> tuple[dict, dict]:
         "graph_mass": A.sum(dim=-1).mean().detach(),
         # share of objects with (almost) no incoming edge weight: root causes of the scene
         "root_fraction": (A.sum(dim=-1) < 0.05).float().mean().detach(),
+        # 'no parent' weight of the noise-free graph used at test time (see SCMGraph._discrete_parents)
+        "no_parent": (out["test_null_weight"][0].mean().detach() if out.get("test_null_weight") is not None
+                      else zero),
         "edge_prob": out["edge_probs"][0][off].mean().detach() if A.shape[0] > 1 else zero,
         **edge_stats,
     }
@@ -344,7 +357,9 @@ def make_balancer(settings, graph_mode: str, method: str = "fixed", curriculum: 
     return LossBalancer(
         base={"task": 1.0, "cf": settings["lambda_cf"], "edge": settings["lambda_edge"],
               "acyclic": LAMBDA_ACYCLIC, "sparse": 0.0 if graph_mode == "discrete" else LAMBDA_SPARSE,
-              "entropy": LAMBDA_ENTROPY},
+              "entropy": LAMBDA_ENTROPY,
+              "root": LAMBDA_ROOT if graph_mode == "discrete" and settings.get("root_target", ROOT_TARGET) is not None
+              else 0.0},
         method=method, curriculum=curriculum, warmup_frac=warmup_frac, ramp_frac=ramp_frac).to(DEVICE)
 
 
@@ -596,6 +611,9 @@ def parse_args(argv=None):
                         help="discrete graph: Gumbel temperature at the first epoch")
     parser.add_argument("--tau-end", type=float, default=TAU_END,
                         help="discrete graph: Gumbel temperature at the last epoch")
+    parser.add_argument("--root-target", type=float, default=ROOT_TARGET,
+                        help="discrete graph: maximum share of 'no parent' (root) objects before a penalty "
+                             "applies; prevents the graph from collapsing to no edges (1.0 = off)")
     parser.add_argument("--relation-types", type=int, default=1,
                         help="R > 1: learned relation types, one message transform per type")
     parser.add_argument("--no-node-identity", action="store_true",
@@ -659,6 +677,8 @@ def settings_from_args(args) -> dict:
         "lambda_edge": 0.0 if (args.no_edge_supervision or args.graph_mode not in ("soft", "discrete"))
         else LAMBDA_EDGE,
         "irrelevant_graph_check": not args.no_irrelevant_graph_check,
+        # discrete graph collapse guard (None = off)
+        "root_target": None if args.root_target is None or args.root_target >= 1.0 else args.root_target,
     }
 
 
@@ -746,7 +766,7 @@ def main(argv=None) -> dict:
 
         total_loss, correct, seen = 0.0, 0, 0
         cf_seen, cf_correct, cf_skipped = 0, 0, 0
-        graph_mass, edge_prob, acyclic_sum, root_sum = 0.0, 0.0, 0.0, 0.0
+        graph_mass, edge_prob, acyclic_sum, root_sum, no_parent_sum = 0.0, 0.0, 0.0, 0.0, 0.0
         optimizer.zero_grad()
         in_batch = 0
 
@@ -777,6 +797,7 @@ def main(argv=None) -> dict:
             edge_prob += float(parts["edge_prob"])
             acyclic_sum += float(parts["acyclic"])
             root_sum += float(parts["root_fraction"])
+            no_parent_sum += float(parts.get("no_parent", 0.0))
             if kind == "f":
                 correct += int(logits.argmax(-1).item() == label.item())
                 seen += 1
@@ -807,6 +828,7 @@ def main(argv=None) -> dict:
                "train_cf_skipped_related": cf_skipped,
                "graph_mass": graph_mass / steps, "mean_edge_prob": edge_prob / steps,
                "acyclicity_h": acyclic_sum / steps, "root_fraction": root_sum / steps,
+               "no_parent_weight": no_parent_sum / steps,
                "competence": level, "curriculum_stage": balancer.stage,
                "loss_weights": balancer.describe(),
                "gumbel_temperature": getattr(model.graph, "temperature", float("nan")) if model.graph is not None
@@ -829,11 +851,13 @@ def main(argv=None) -> dict:
             print(f"Graph: parent weight/obj : {row['graph_mass']:.3f}   mean edge prob: {row['mean_edge_prob']:.3f}")
             print(f"Structure                : acyclicity h(A) {row['acyclicity_h']:.4f} (0 = DAG)   "
                   f"root objects {100 * row['root_fraction']:.1f}%"
-                  + (f"   Gumbel tau {row['gumbel_temperature']:.3f}" if args.graph_mode == "discrete" else ""))
+                  + (f"   Gumbel tau {row['gumbel_temperature']:.3f}   no-parent weight "
+                     f"{row['no_parent_weight']:.2f}" if args.graph_mode == "discrete" else ""))
             print(f"Relations (val)          : edge prob for touching objects "
                   f"{val['val_edge_prob_contact']:.3f} vs distant {val['val_edge_prob_far']:.3f}")
-            if row["graph_mass"] < 0.05:
-                print("WARNING: the relation graph is collapsing (almost no edge weight left).")
+            if row["graph_mass"] < 0.05 or row["root_fraction"] > 0.95:
+                print("WARNING: the relation graph is collapsing (almost no edge weight left). "
+                      "Structure metrics such as 'DAG 100%' are meaningless for an empty graph.")
 
         pd.DataFrame(history).to_csv(paths["history"], index=False)
         if val["val_factual_accuracy"] > best_val:

@@ -204,6 +204,7 @@ class SCMGraph(nn.Module):
                 "probs": probs,
                 "scores": scores,
                 "null_weight": sampled["null_weight"],            # [B, N] weight of "no parent"
+                "test_null_weight": sampled["test_null_weight"],  # [B, N] same, noise-free graph
                 "relation_probs": relation_probs,
                 "geometry": geometry,
             }
@@ -272,6 +273,7 @@ class SCMGraph(nn.Module):
         context = torch.cat([objects, q[:, None, :].expand(B, N, D)], dim=-1)
         null_logit = self.null_mlp(context)                                   # [B, N, 1]
         order = self.order_mlp(context).squeeze(-1)                           # [B, N]
+        order_clean = order
         sampling = self.training and self.sample
         if sampling:
             uniform = torch.rand_like(order).clamp(1e-9, 1.0 - 1e-9)
@@ -300,8 +302,19 @@ class SCMGraph(nn.Module):
         # a chosen parent with negligible weight (possible at low temperature) is not an edge
         hard = hard * (hard > self.min_edge_weight).to(hard.dtype)
         weights = hard + (soft - soft.detach()) if self.training else hard
+
+        # "no parent" probability of the noise-free (test-time) graph, differentiable.  While
+        # training, Gumbel noise often lets an edge beat a slightly stronger "no parent" logit,
+        # but at test time (no noise, low temperature) "no parent" then wins every time and the
+        # graph is empty.  The collapse guard in train.py therefore acts on this quantity.
+        clean_ranked = order_clean - tie_break
+        clean_allowed = clean_ranked[:, None, :] > clean_ranked[:, :, None]
+        clean_mask = torch.where(clean_allowed, 0.0, -1e9).to(scores.dtype)
+        clean_soft_mask = torch.nn.functional.logsigmoid((order_clean[:, None, :] - order_clean[:, :, None]) / tau)
+        clean_edges = scores + clean_mask + (clean_soft_mask - clean_soft_mask.detach())
+        clean_null = torch.softmax(torch.cat([clean_edges, null_logit], dim=-1) / tau, dim=-1)[..., N]
         return {"adjacency": weights[..., :N], "null_weight": weights[..., N], "candidate_logits": candidates,
-                "allowed": allowed, "order": order}
+                "allowed": allowed, "order": order, "test_null_weight": clean_null}
 
     def normalise(self, adjacency):
         """Row normalisation used by the message passing (also used after interventions).

@@ -415,6 +415,7 @@ class SCMVLM(nn.Module):
             "adjacency": adjacency,
             "edge_probs": graph_output["probs"],
             "null_weight": graph_output.get("null_weight"),
+            "test_null_weight": graph_output.get("test_null_weight"),
             "candidate_logits": graph_output.get("candidate_logits"),
             "allowed_parents": graph_output.get("allowed_parents"),
             "causal_order": graph_output.get("causal_order"),

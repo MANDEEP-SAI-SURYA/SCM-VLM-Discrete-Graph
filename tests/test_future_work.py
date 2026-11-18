@@ -291,3 +291,60 @@ def test_counterfactual_items_are_skipped_during_warmup(make_model):
     _, correct, parts = train.counterfactual_step(model, _detections(), torch.randn(768), example,
                                                   ANSWER2IDX, settings)
     assert correct is None and parts["skipped"]
+
+
+# ===================================================================== collapse guard / evaluation
+def test_root_guard_pushes_a_collapsing_discrete_graph_back(make_model):
+    """With a huge 'no parent' logit every object is a root (empty graph); the root hinge must
+    produce a gradient that lowers the no-parent logit.  Below the target it costs nothing."""
+    import train
+
+    model = make_model(graph_mode="discrete").train()
+    with torch.no_grad():
+        model.graph.null_mlp[-1].bias.fill_(10.0)
+    settings = {"cf_mode": "none", "lambda_cf": 1.0, "lambda_edge": 0.5, "irrelevant_graph_check": True}
+    out = train.forward_detections(model, _detections(), torch.randn(768))
+    terms, parts = train.graph_terms(model, out, BOXES, settings)
+    assert float(parts["no_parent"]) > 0.9 and float(terms["root"]) > 0.4
+    terms["root"].backward()
+    assert float(model.graph.null_mlp[-1].bias.grad) > 0          # gradient descent lowers the logit
+    with torch.no_grad():
+        model.graph.null_mlp[-1].bias.fill_(-10.0)
+    out = train.forward_detections(model, _detections(), torch.randn(768))
+    terms, _ = train.graph_terms(model, out, BOXES, settings)
+    assert float(terms["root"]) == 0.0
+    off, _ = train.graph_terms(model, out, BOXES, {**settings, "root_target": None})
+    assert "root" not in off
+
+
+def test_root_guard_is_only_used_for_the_discrete_graph():
+    import train
+
+    settings = {"cf_mode": "none", "lambda_cf": 1.0, "lambda_edge": 0.5}
+    assert train.make_balancer(settings, "discrete").base["root"] == train.LAMBDA_ROOT
+    assert train.make_balancer(settings, "soft").base["root"] == 0.0
+    assert train.make_balancer({**settings, "root_target": None}, "discrete").base["root"] == 0.0
+    args = train.parse_args(["--graph-mode", "discrete", "--root-target", "1.0"])
+    assert train.settings_from_args(args)["root_target"] is None
+
+
+def test_compare_runs_pairs_seeds_and_tests_against_the_baseline(tmp_path):
+    import json
+    import pandas as pd
+    from compare_runs import main, split_tag
+
+    assert split_tag("soft_s1") == ("soft", "_s1") and split_tag("fw_all") == ("fw_all", "")
+    rng = __import__("random").Random(0)
+    for tag, p in [("base", 0.5), ("base_s1", 0.5), ("new", 0.9), ("new_s1", 0.9)]:
+        correct = [int(rng.random() < p) for _ in range(200)]
+        pd.DataFrame({"question_id": range(200), "correct_learned": correct}).to_csv(
+            tmp_path / f"eval_factual_{tag}.csv", index=False)
+        pd.DataFrame({"question": [f"q{i}" for i in range(100)], "cf_correct": correct[:100]}).to_csv(
+            tmp_path / f"eval_counterfactual_{tag}.csv", index=False)
+        (tmp_path / f"eval_summary_{tag}.json").write_text(json.dumps({
+            "factual_accuracy": {"overall": 100 * sum(correct) / 200},
+            "counterfactual_accuracy": {"overall": 100 * sum(correct[:100]) / 100}}))
+    table, tests = main(["--baseline", "base", "--results", str(tmp_path), "base", "base_s1", "new", "new_s1"])
+    assert list(table.index) == ["base", "new"] and (table["seeds"] == 2).all()
+    assert len(tests) == 2 and (tests["factual p"] < 1e-6).all()
+    assert (tmp_path / "comparison.md").is_file()
